@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+cluster_file="${FDB_CLUSTER_FILE:-/var/fdb/fdb.cluster}"
+fdb_port="${FDB_PORT:-4500}"
+fdbserver_bin="${FDBSERVER_BIN:-/usr/bin/fdbserver}"
+tini_bin="${TINI_BIN:-/usr/bin/tini}"
+
+[[ -r "$cluster_file" ]] || {
+  echo "FoundationDB cluster file is not readable: $cluster_file" >&2
+  exit 1
+}
+
+connection_string="$(
+  awk '
+    {
+      sub(/#.*/, "")
+      gsub(/[[:space:]]/, "")
+      if (length($0)) {
+        print
+        exit
+      }
+    }
+  ' "$cluster_file"
+)"
+
+[[ "$connection_string" == *@* ]] || {
+  echo "FoundationDB cluster file does not contain a valid connection string" >&2
+  exit 1
+}
+
+coordinator_addresses="${connection_string#*@}"
+public_address="${coordinator_addresses%%,*}"
+[[ -n "$public_address" && "$public_address" == *:* ]] || {
+  echo "FoundationDB cluster file does not contain a coordinator address" >&2
+  exit 1
+}
+
+case "$public_address" in
+  127.0.0.1:* | 0.0.0.0:* | invalidIP:*)
+    container_ip="$(hostname -i | awk '{print $1}')"
+    [[ -n "$container_ip" ]] || {
+      echo "Unable to determine the FoundationDB container IP" >&2
+      exit 1
+    }
+    public_address="${container_ip}:${fdb_port}"
+    printf '%s@%s\n' "${connection_string%@*}" "$public_address" >"$cluster_file"
+    ;;
+esac
+
+locality_id="${FDB_LOCALITY_ID:-$(hostname)}"
+fdbserver_args=(
+  --listen-address "0.0.0.0:${fdb_port}"
+  --public-address "$public_address"
+  --datadir /var/fdb/data
+  --logdir /var/fdb/logs
+  --locality-zoneid "$locality_id"
+  --locality-machineid "$locality_id"
+)
+
+[[ -n "${FDB_PROCESS_CLASS:-}" ]] && fdbserver_args+=(--class "$FDB_PROCESS_CLASS")
+fdbserver_args+=("$@")
+
+if [[ -x "$tini_bin" ]]; then
+  exec "$tini_bin" -g -- "$fdbserver_bin" "${fdbserver_args[@]}"
+fi
+
+exec "$fdbserver_bin" "${fdbserver_args[@]}"

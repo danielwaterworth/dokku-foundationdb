@@ -1,0 +1,474 @@
+#!/usr/bin/env bash
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/config"
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/property-functions"
+source "$PLUGIN_AVAILABLE_PATH/config/functions"
+
+add_to_links_file() {
+  declare SERVICE="$1" APP="$2"
+  local links_file="$PLUGIN_DATA_ROOT/$SERVICE/LINKS"
+
+  touch "$links_file"
+  sed -i.bak "/^${APP}\$/d" "$links_file"
+  rm -f "$links_file.bak"
+  echo "$APP" >>"$links_file"
+  sort -u -o "$links_file" "$links_file"
+}
+
+auth_service_filter() {
+  declare SERVICES=("$@")
+  local service user_auth_count
+
+  user_auth_count="$(find "$PLUGIN_PATH"/enabled/*/user-auth-service 2>/dev/null | wc -l)"
+  if [[ "$user_auth_count" -eq 0 ]] || { [[ "$user_auth_count" -eq 1 ]] && [[ -f "$PLUGIN_PATH/enabled/20_events/user-auth-service" ]]; }; then
+    for service in "${SERVICES[@]}"; do
+      [[ -n "$service" ]] && echo "$service"
+    done
+    return 0
+  fi
+
+  export SSH_USER=${SSH_USER:=$USER}
+  export SSH_NAME=${NAME:="default"}
+  plugn trigger user-auth-service "$SSH_USER" "$SSH_NAME" "$PLUGIN_COMMAND_PREFIX" "${SERVICES[@]}"
+}
+
+fn-services-list() {
+  declare FILTER="${1:-true}"
+  local service services=()
+
+  [[ -d "$PLUGIN_DATA_ROOT" ]] || return 0
+  while IFS= read -r service; do
+    services+=("$service")
+  done < <(find "$PLUGIN_DATA_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)
+
+  [[ "${#services[@]}" -gt 0 ]] || return 0
+  if [[ "$FILTER" == "false" ]]; then
+    printf '%s\n' "${services[@]}"
+  else
+    auth_service_filter "${services[@]}"
+  fi
+}
+
+get_container_ip() {
+  declare CONTAINER_ID="$1" NETWORK="${2:-}"
+  local address
+
+  if [[ -n "$NETWORK" ]]; then
+    address="$("$DOCKER_BIN" container inspect --format "{{with index .NetworkSettings.Networks \"$NETWORK\"}}{{.IPAddress}}{{end}}" "$CONTAINER_ID" 2>/dev/null || true)"
+  else
+    address="$("$DOCKER_BIN" container inspect --format '{{.NetworkSettings.IPAddress}}' "$CONTAINER_ID" 2>/dev/null || true)"
+    if [[ -z "$address" ]]; then
+      address="$("$DOCKER_BIN" container inspect --format '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' "$CONTAINER_ID" 2>/dev/null | awk 'NF {print; exit}' || true)"
+    fi
+  fi
+
+  echo "$address"
+}
+
+get_service_name() {
+  declare SERVICE="$1"
+  echo "dokku.${PLUGIN_COMMAND_PREFIX}.${SERVICE}"
+}
+
+in_links_file() {
+  declare SERVICE="$1" APP="$2"
+  local links_file="$PLUGIN_DATA_ROOT/$SERVICE/LINKS"
+
+  [[ -f "$links_file" ]] && grep -qE "^${APP}\$" "$links_file"
+}
+
+is_container_status() {
+  declare CID="$1" STATUS="$2"
+  [[ "$("$DOCKER_BIN" container inspect -f "{{.State.${STATUS}}}" "$CID" 2>/dev/null || true)" == "true" ]]
+}
+
+is_valid_service_name() {
+  declare SERVICE="$1"
+  [[ -n "$SERVICE" ]] && [[ "$SERVICE" =~ ^[A-Za-z0-9_-]+$ ]]
+}
+
+remove_from_links_file() {
+  declare SERVICE="$1" APP="$2"
+  local links_file="$PLUGIN_DATA_ROOT/$SERVICE/LINKS"
+
+  [[ -f "$links_file" ]] || return 0
+  sed -i.bak "/^${APP}\$/d" "$links_file"
+  rm -f "$links_file.bak"
+}
+
+service_alternative_config_var() {
+  declare EXISTING_CONFIG="$1"
+  local color candidate
+  local colors=(AQUA BLACK BLUE FUCHSIA GRAY GREEN LIME MAROON NAVY OLIVE PURPLE RED SILVER TEAL WHITE YELLOW)
+
+  for color in "${colors[@]}"; do
+    candidate="${PLUGIN_ALT_ALIAS}_${color}_CLUSTER_FILE_CONTENTS"
+    if ! grep -q "^${candidate}:" <<<"$EXISTING_CONFIG"; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+service_app_links() {
+  declare APP="$1"
+  local service
+
+  for service in $(fn-services-list true); do
+    in_links_file "$service" "$APP" && echo "$service"
+  done
+}
+
+service_commit_config() {
+  declare SERVICE="$1"
+  local config_options custom_env
+  local service_root="$PLUGIN_DATA_ROOT/$SERVICE"
+
+  custom_env="${FOUNDATIONDB_CUSTOM_ENV:-}"
+  [[ -n "${SERVICE_CUSTOM_ENV:-}" ]] && custom_env="$SERVICE_CUSTOM_ENV"
+  if [[ -n "$custom_env" ]]; then
+    tr ';' '\n' <<<"$custom_env" >"$service_root/ENV"
+  else
+    : >"$service_root/ENV"
+  fi
+
+  config_options="${FOUNDATIONDB_CONFIG_OPTIONS:-}"
+  [[ -n "${PLUGIN_CONFIG_OPTIONS:-}" ]] && config_options="$PLUGIN_CONFIG_OPTIONS"
+  printf '%s\n' "$config_options" >"$service_root/CONFIG_OPTIONS"
+  printf '%s\n' "${SERVICE_STORAGE_ENGINE:-$FOUNDATIONDB_STORAGE_ENGINE}" >"$service_root/STORAGE_ENGINE"
+  printf '%s\n' "$PLUGIN_IMAGE" >"$service_root/IMAGE"
+  printf '%s\n' "$PLUGIN_IMAGE_VERSION" >"$service_root/IMAGE_VERSION"
+
+  [[ -n "${SERVICE_MEMORY:-}" ]] && printf '%s\n' "$SERVICE_MEMORY" >"$service_root/SERVICE_MEMORY"
+  [[ -n "${SERVICE_INITIAL_NETWORK:-}" ]] && fn-plugin-property-write "$PLUGIN_COMMAND_PREFIX" "$SERVICE" initial-network "$SERVICE_INITIAL_NETWORK"
+  [[ -n "${SERVICE_POST_CREATE_NETWORK:-}" ]] && fn-plugin-property-write "$PLUGIN_COMMAND_PREFIX" "$SERVICE" post-create-network "$SERVICE_POST_CREATE_NETWORK"
+  [[ -n "${SERVICE_POST_START_NETWORK:-}" ]] && fn-plugin-property-write "$PLUGIN_COMMAND_PREFIX" "$SERVICE" post-start-network "$SERVICE_POST_START_NETWORK"
+}
+
+service_connection_string() {
+  declare SERVICE="$1"
+  local cluster_file="$PLUGIN_DATA_ROOT/$SERVICE/$PLUGIN_CONFIG_SUFFIX/fdb.cluster"
+
+  [[ -f "$cluster_file" ]] && tr -d '\n' <"$cluster_file"
+}
+
+service_config_var_for_link() {
+  declare SERVICE="$1" APP="$2"
+  local metadata_file="$PLUGIN_DATA_ROOT/$SERVICE/links/$APP"
+
+  [[ -f "$metadata_file" ]] && tr -d '\n' <"$metadata_file"
+}
+
+service_container_rm() {
+  declare SERVICE="$1"
+  local service_name
+
+  service_name="$(get_service_name "$SERVICE")"
+
+  service_stop "$SERVICE" true
+  if "$DOCKER_BIN" container inspect "$service_name" >/dev/null 2>&1; then
+    "$DOCKER_BIN" container update --restart=no "$service_name" >/dev/null 2>&1 || true
+    "$DOCKER_BIN" container rm "$service_name" >/dev/null || dokku_log_fail "Unable to remove container for service $SERVICE"
+  fi
+}
+
+service_dns_hostname() {
+  declare SERVICE="$1"
+  get_service_name "$SERVICE" | tr ._ -
+}
+
+service_enter() {
+  declare SERVICE="$1"
+  shift
+  local id run_opts=()
+
+  id="$(<"$PLUGIN_DATA_ROOT/$SERVICE/ID")"
+  "$DOCKER_BIN" container inspect "$id" >/dev/null 2>&1 || dokku_log_fail "Service container does not exist"
+  is_container_status "$id" Running || dokku_log_fail "Service container is not running"
+  has_tty && run_opts=(-i -t)
+  "$DOCKER_BIN" container exec "${run_opts[@]}" "$id" "${@:-/bin/bash}"
+}
+
+service_exposed_ports() {
+  echo '-'
+}
+
+service_image_exists() {
+  declare SERVICE="$1"
+  local image="$PLUGIN_IMAGE" version="$PLUGIN_IMAGE_VERSION"
+  local service_root="$PLUGIN_DATA_ROOT/$SERVICE"
+
+  [[ -f "$service_root/IMAGE" ]] && image="$(<"$service_root/IMAGE")"
+  [[ -f "$service_root/IMAGE_VERSION" ]] && version="$(<"$service_root/IMAGE_VERSION")"
+  [[ -n "$("$DOCKER_BIN" image ls -q "${image}:${version}" 2>/dev/null)" ]]
+}
+
+service_info() {
+  declare SERVICE="$1" INFO_FLAG="${2:-}"
+  local service_root="$PLUGIN_DATA_ROOT/$SERVICE"
+  local id="-" flag key valid_flags="" match=false
+
+  [[ -s "$service_root/ID" ]] && id="$(<"$service_root/ID")"
+  local flag_map=(
+    "--cluster-file: ${service_root}/${PLUGIN_CONFIG_SUFFIX}/fdb.cluster"
+    "--config-options: $(<"$service_root/CONFIG_OPTIONS")"
+    "--connection-string: $(service_connection_string "$SERVICE")"
+    "--data-dir: ${service_root}/data"
+    "--dsn: $(service_connection_string "$SERVICE")"
+    "--exposed-ports: -"
+    "--id: ${id}"
+    "--internal-ip: $(get_container_ip "$id" "$(fn-plugin-property-get "$PLUGIN_COMMAND_PREFIX" "$SERVICE" initial-network)")"
+    "--initial-network: $(fn-plugin-property-get "$PLUGIN_COMMAND_PREFIX" "$SERVICE" initial-network)"
+    "--links: $(service_linked_apps "$SERVICE")"
+    "--post-create-network: $(fn-plugin-property-get "$PLUGIN_COMMAND_PREFIX" "$SERVICE" post-create-network)"
+    "--post-start-network: $(fn-plugin-property-get "$PLUGIN_COMMAND_PREFIX" "$SERVICE" post-start-network)"
+    "--service-root: ${service_root}"
+    "--status: $(service_status "$SERVICE")"
+    "--storage-engine: $(<"$service_root/STORAGE_ENGINE")"
+    "--version: $(service_version "$SERVICE")"
+  )
+
+  if [[ -z "$INFO_FLAG" ]]; then
+    dokku_log_info2_quiet "$SERVICE $PLUGIN_COMMAND_PREFIX service information"
+    for flag in "${flag_map[@]}"; do
+      key="$(cut -d: -f1 <<<"${flag#--}" | tr - ' ')"
+      dokku_log_verbose "$(printf '%-22s %-25s' "${key^}" "${flag#*: }")"
+    done
+    return 0
+  fi
+
+  for flag in "${flag_map[@]}"; do
+    valid_flags+=" $(cut -d: -f1 <<<"$flag")"
+    if [[ "$flag" == "${INFO_FLAG}:"* ]]; then
+      echo "${flag#*: }"
+      match=true
+    fi
+  done
+  [[ "$match" == true ]] || dokku_log_fail "Invalid flag passed, valid flags:${valid_flags}"
+}
+
+service_is_linked() {
+  declare SERVICE="$1" APP="$2"
+  in_links_file "$SERVICE" "$APP" || dokku_log_fail "Service $SERVICE is not linked to $APP"
+  dokku_log_info1 "Service $SERVICE is linked to $APP"
+}
+
+service_link() {
+  declare SERVICE="$1" APP="$2"
+  local service_root="$PLUGIN_DATA_ROOT/$SERVICE"
+  local service_name service_hostname connection_string existing_config
+  local config_var="FDB_CLUSTER_FILE_CONTENTS"
+
+  service_name="$(get_service_name "$SERVICE")"
+  service_hostname="$(service_dns_hostname "$SERVICE")"
+  connection_string="$(service_connection_string "$SERVICE")"
+  existing_config="$(config_all "$APP")"
+
+  in_links_file "$SERVICE" "$APP" && dokku_log_fail "Service $SERVICE is already linked to $APP"
+  [[ -n "$connection_string" ]] || dokku_log_fail "Service $SERVICE has no connection string"
+
+  if [[ -n "${SERVICE_ALIAS:-}" ]]; then
+    config_var="${SERVICE_ALIAS^^}"
+    config_var="${config_var%_CLUSTER_FILE_CONTENTS}_CLUSTER_FILE_CONTENTS"
+    [[ "$config_var" =~ ^[A-Z_][A-Z0-9_]*$ ]] || dokku_log_fail "Alias must produce a valid environment-variable name"
+    grep -q "^${config_var}:" <<<"$existing_config" && dokku_log_fail "Specified alias $config_var is already in use"
+  elif grep -q '^FDB_CLUSTER_FILE_CONTENTS:' <<<"$existing_config"; then
+    config_var="$(service_alternative_config_var "$existing_config")" || dokku_log_fail "Unable to generate a connection-string alias"
+  fi
+
+  plugn trigger service-action pre-link "$PLUGIN_COMMAND_PREFIX" "$SERVICE" "$APP"
+  add_to_links_file "$SERVICE" "$APP"
+  mkdir -p "$service_root/links"
+  printf '%s\n' "$config_var" >"$service_root/links/$APP"
+
+  if declare -F add_passed_docker_option >/dev/null; then
+    # shellcheck disable=SC2034
+    local passed_phases=(build deploy run)
+    add_passed_docker_option passed_phases[@] "--link $service_name:$service_hostname"
+  else
+    dokku docker-options:add "$APP" build,deploy,run "--link $service_name:$service_hostname"
+  fi
+
+  plugn trigger service-action post-link "$PLUGIN_COMMAND_PREFIX" "$SERVICE" "$APP"
+  if [[ "${DOKKU_GLOBAL_FLAGS:-}" == *--no-restart* ]] || [[ "${SERVICE_RESTART_APPS:-}" == false ]]; then
+    config_set --no-restart "$APP" "${config_var}=${connection_string}"
+    dokku_log_verbose "Skipping restart of linked app"
+  else
+    config_set "$APP" "${config_var}=${connection_string}"
+  fi
+  plugn trigger service-action post-link-complete "$PLUGIN_COMMAND_PREFIX" "$SERVICE" "$APP"
+}
+
+service_sync_linked_apps() {
+  declare SERVICE="$1"
+  local app config_var connection_string
+
+  connection_string="$(service_connection_string "$SERVICE")"
+  while IFS= read -r app; do
+    [[ -n "$app" ]] || continue
+    config_var="$(service_config_var_for_link "$SERVICE" "$app")"
+    [[ -n "$config_var" ]] || continue
+    if ! config_set --no-restart "$app" "${config_var}=${connection_string}"; then
+      dokku_log_warn "Unable to refresh the $config_var value for app $app"
+    fi
+  done < <(service_links "$SERVICE")
+}
+
+service_linked_apps() {
+  declare SERVICE="$1"
+  local links_file="$PLUGIN_DATA_ROOT/$SERVICE/LINKS"
+
+  touch "$links_file"
+  [[ -s "$links_file" ]] || { echo '-'; return 0; }
+  tr '\n' ' ' <"$links_file"
+}
+
+service_links() {
+  declare SERVICE="$1"
+  local links_file="$PLUGIN_DATA_ROOT/$SERVICE/LINKS"
+  [[ -f "$links_file" ]] && cat "$links_file"
+}
+
+service_list() {
+  local services=() service
+  mapfile -t services < <(fn-services-list true)
+  if [[ "${#services[@]}" -eq 0 ]]; then
+    dokku_log_warn "There are no $PLUGIN_SERVICE services"
+    return 0
+  fi
+
+  dokku_log_info2_quiet "$PLUGIN_SERVICE services"
+  for service in "${services[@]}"; do
+    echo "$service"
+  done
+}
+
+service_logs() {
+  declare SERVICE="$1" TAIL_FLAG="${2:-}" TAIL_COUNT="${3:-all}"
+  local id
+  local args=(--tail "$TAIL_COUNT")
+
+  id="$(<"$PLUGIN_DATA_ROOT/$SERVICE/ID")"
+
+  if [[ "$TAIL_FLAG" == -t || "$TAIL_FLAG" == --tail ]]; then
+    args+=(--follow)
+  elif [[ -n "$TAIL_FLAG" ]]; then
+    args=(--tail "$TAIL_FLAG")
+  fi
+  "$DOCKER_BIN" container inspect "$id" >/dev/null 2>&1 || dokku_log_fail "Service container does not exist"
+  "$DOCKER_BIN" container logs "${args[@]}" "$id" 2>&1
+}
+
+service_parse_args() {
+  local arg
+
+  for arg in "$@"; do
+    shift
+    case "$arg" in
+      --alias) set -- "$@" -a ;;
+      --config-options) set -- "$@" -c ;;
+      --custom-env) set -- "$@" -C ;;
+      --image) set -- "$@" -i ;;
+      --image-version) set -- "$@" -I ;;
+      --initial-network) set -- "$@" -N ;;
+      --memory) set -- "$@" -m ;;
+      --no-restart) set -- "$@" -n ;;
+      --post-create-network) set -- "$@" -P ;;
+      --post-start-network) set -- "$@" -S ;;
+      --storage-engine) set -- "$@" -e ;;
+      *) set -- "$@" "$arg" ;;
+    esac
+  done
+
+  OPTIND=1
+  while getopts 'a:c:C:e:i:I:m:nN:P:S:' arg; do
+    case "$arg" in
+      a) export SERVICE_ALIAS="$OPTARG" ;;
+      c) export PLUGIN_CONFIG_OPTIONS="$OPTARG" ;;
+      C) export SERVICE_CUSTOM_ENV="$OPTARG" ;;
+      e) export SERVICE_STORAGE_ENGINE="$OPTARG" ;;
+      i) export PLUGIN_IMAGE="$OPTARG" ;;
+      I) export PLUGIN_IMAGE_VERSION="$OPTARG" ;;
+      m) export SERVICE_MEMORY="$OPTARG" ;;
+      n) export SERVICE_RESTART_APPS=false ;;
+      N) export SERVICE_INITIAL_NETWORK="$OPTARG" ;;
+      P) export SERVICE_POST_CREATE_NETWORK="$OPTARG" ;;
+      S) export SERVICE_POST_START_NETWORK="$OPTARG" ;;
+      *) return 1 ;;
+    esac
+  done
+}
+
+service_status() {
+  declare SERVICE="$1"
+  local id_file="$PLUGIN_DATA_ROOT/$SERVICE/ID"
+  [[ -s "$id_file" ]] || { echo missing; return 0; }
+  "$DOCKER_BIN" container inspect -f '{{.State.Status}}' "$(<"$id_file")" 2>/dev/null || echo missing
+}
+
+service_stop() {
+  declare SERVICE="$1" QUIET="${2:-false}"
+  local service_name id
+
+  service_name="$(get_service_name "$SERVICE")"
+
+  id="$("$DOCKER_BIN" container ps -q --no-trunc --filter "name=^/${service_name}$" 2>/dev/null || true)"
+  if [[ -z "$id" ]]; then
+    [[ "$QUIET" == true ]] || dokku_log_warn "Service is already stopped"
+    return 0
+  fi
+
+  dokku_log_info2_quiet "Stopping container"
+  "$DOCKER_BIN" container stop "$service_name" >/dev/null
+  dokku_log_verbose_quiet "Container stopped"
+}
+
+service_unlink() {
+  declare SERVICE="$1" APP="$2"
+  local service_name service_hostname config_var
+
+  service_name="$(get_service_name "$SERVICE")"
+  service_hostname="$(service_dns_hostname "$SERVICE")"
+  config_var="$(service_config_var_for_link "$SERVICE" "$APP")"
+
+  in_links_file "$SERVICE" "$APP" || dokku_log_fail "Service $SERVICE is not linked to $APP"
+  plugn trigger service-action pre-unlink "$PLUGIN_COMMAND_PREFIX" "$SERVICE" "$APP"
+
+  if declare -F remove_passed_docker_option >/dev/null; then
+    # shellcheck disable=SC2034
+    local passed_phases=(build deploy run)
+    remove_passed_docker_option passed_phases[@] "--link $service_name:$service_hostname"
+  else
+    dokku docker-options:remove "$APP" build,deploy,run "--link $service_name:$service_hostname"
+  fi
+
+  remove_from_links_file "$SERVICE" "$APP"
+  rm -f "$PLUGIN_DATA_ROOT/$SERVICE/links/$APP"
+  plugn trigger service-action post-unlink "$PLUGIN_COMMAND_PREFIX" "$SERVICE" "$APP"
+
+  if [[ -n "$config_var" ]]; then
+    if [[ "${DOKKU_GLOBAL_FLAGS:-}" == *--no-restart* ]] || [[ "${SERVICE_RESTART_APPS:-}" == false ]]; then
+      config_unset --no-restart "$APP" "$config_var"
+      dokku_log_verbose "Skipping restart of unlinked app"
+    else
+      config_unset "$APP" "$config_var"
+    fi
+  fi
+  plugn trigger service-action post-unlink-complete "$PLUGIN_COMMAND_PREFIX" "$SERVICE" "$APP"
+}
+
+service_version() {
+  declare SERVICE="$1"
+  "$DOCKER_BIN" container inspect -f '{{.Config.Image}}' "$(get_service_name "$SERVICE")" 2>/dev/null || true
+}
+
+verify_service_name() {
+  declare SERVICE="$1"
+  [[ -n "$SERVICE" ]] || dokku_log_fail "SERVICE must not be empty"
+  [[ -d "$PLUGIN_DATA_ROOT/$SERVICE" ]] || dokku_log_fail "$PLUGIN_SERVICE service $SERVICE does not exist"
+  [[ -n "$(auth_service_filter "$SERVICE")" ]] || dokku_log_fail "$PLUGIN_SERVICE service $SERVICE does not exist"
+}

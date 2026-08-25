@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+
+config_all() {
+  return 0
+}
+
+config_set() {
+  return 0
+}
+
+config_unset() {
+  return 0
+}

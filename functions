@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/config"
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common-functions"
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/property-functions"
+source "$PLUGIN_AVAILABLE_PATH/config/functions"
+if [[ -f "$PLUGIN_AVAILABLE_PATH/docker-options/functions" ]]; then
+  source "$PLUGIN_AVAILABLE_PATH/docker-options/functions"
+fi
+
+service_connect() {
+  declare SERVICE="$1"
+  local service_name
+  local tty_opts=()
+
+  service_name="$(get_service_name "$SERVICE")"
+  has_tty && tty_opts=(-t)
+  "$DOCKER_BIN" container exec -i "${tty_opts[@]}" "$service_name" fdbcli -C /var/fdb/fdb.cluster
+}
+
+service_create() {
+  declare SERVICE="$1"
+  local service_root links_file storage_engine
+
+  is_valid_service_name "$SERVICE" || dokku_log_fail "Please specify a valid service name. Valid characters are: A-Z, a-z, 0-9, underscore, and hyphen"
+  [[ ! -d "$PLUGIN_DATA_ROOT/$SERVICE" ]] || dokku_log_fail "$PLUGIN_SERVICE service $SERVICE already exists"
+  service_parse_args "${@:2}"
+  storage_engine="${SERVICE_STORAGE_ENGINE:-$FOUNDATIONDB_STORAGE_ENGINE}"
+  [[ "$storage_engine" == ssd || "$storage_engine" == memory ]] || dokku_log_fail "Storage engine must be 'ssd' or 'memory'"
+
+  if ! service_image_exists "$SERVICE"; then
+    if [[ "$PLUGIN_DISABLE_PULL" == true ]]; then
+      dokku_log_fail "${PLUGIN_DISABLE_PULL_VARIABLE} is set and image ${PLUGIN_IMAGE}:${PLUGIN_IMAGE_VERSION} is not available"
+    fi
+    "$DOCKER_BIN" image pull "${PLUGIN_IMAGE}:${PLUGIN_IMAGE_VERSION}" || dokku_log_fail "$PLUGIN_SERVICE image pull failed"
+  fi
+
+  plugn trigger service-action pre-create "$PLUGIN_COMMAND_PREFIX" "$SERVICE"
+  service_root="$PLUGIN_DATA_ROOT/$SERVICE"
+  links_file="$service_root/LINKS"
+  mkdir -p "$service_root/data" "$service_root/logs" "$service_root/$PLUGIN_CONFIG_SUFFIX" "$service_root/links"
+  touch "$links_file"
+  printf 'dokku_%s:%s@127.0.0.1:%s\n' "$(tr - _ <<<"$SERVICE" | tr -d '\n')" "$(openssl rand -hex 16)" "$PLUGIN_DATASTORE_WAIT_PORT" >"$service_root/$PLUGIN_CONFIG_SUFFIX/fdb.cluster"
+  service_commit_config "$SERVICE"
+  plugn trigger service-action post-create "$PLUGIN_COMMAND_PREFIX" "$SERVICE"
+  service_create_container "$SERVICE"
+  plugn trigger service-action post-create-complete "$PLUGIN_COMMAND_PREFIX" "$SERVICE"
+}
+
+service_create_container() {
+  declare SERVICE="$1"
+  local service_root="$PLUGIN_DATA_ROOT/$SERVICE"
+  local service_host_root="$PLUGIN_DATA_HOST_ROOT/$SERVICE"
+  local service_name network network_alias network_to_add
+  local config_options="" storage_engine
+  local config_args=() docker_args=()
+
+  service_name="$(get_service_name "$SERVICE")"
+  [[ -f "$service_root/IMAGE" ]] && PLUGIN_IMAGE="$(<"$service_root/IMAGE")"
+  [[ -f "$service_root/IMAGE_VERSION" ]] && PLUGIN_IMAGE_VERSION="$(<"$service_root/IMAGE_VERSION")"
+  [[ -f "$service_root/CONFIG_OPTIONS" ]] && config_options="$(<"$service_root/CONFIG_OPTIONS")"
+  [[ -n "$config_options" ]] && read -r -a config_args <<<"$config_options"
+  storage_engine="$(<"$service_root/STORAGE_ENGINE")"
+  network_alias="$(service_dns_hostname "$SERVICE")"
+  network="$(fn-plugin-property-get "$PLUGIN_COMMAND_PREFIX" "$SERVICE" initial-network)"
+
+  rm -f "$service_root/ID"
+  install -m 0755 "$PLUGIN_FDB_ENTRYPOINT" "$service_root/$PLUGIN_CONFIG_SUFFIX/dokku-entrypoint"
+  docker_args+=("--cidfile=$service_root/ID")
+  docker_args+=("--entrypoint=/var/fdb/dokku-entrypoint")
+  docker_args+=("--env-file=$service_root/ENV")
+  docker_args+=("--env=FDB_CLUSTER_FILE=/var/fdb/fdb.cluster")
+  docker_args+=("--env=FDB_NETWORKING_MODE=container")
+  docker_args+=("--hostname=$service_name")
+  docker_args+=("--label=dokku.service=$PLUGIN_COMMAND_PREFIX")
+  docker_args+=("--label=dokku=service")
+  docker_args+=("--name=$service_name")
+  docker_args+=("--restart=always")
+  docker_args+=("--volume=$service_host_root/data:/var/fdb/data")
+  docker_args+=("--volume=$service_host_root/logs:/var/fdb/logs")
+  docker_args+=("--volume=$service_host_root/$PLUGIN_CONFIG_SUFFIX/fdb.cluster:/var/fdb/fdb.cluster")
+  docker_args+=("--volume=$service_host_root/$PLUGIN_CONFIG_SUFFIX/dokku-entrypoint:/var/fdb/dokku-entrypoint:ro")
+
+  [[ -f "$service_root/SERVICE_MEMORY" ]] && docker_args+=("--memory=$(<"$service_root/SERVICE_MEMORY")m")
+  if [[ -n "$network" ]]; then
+    docker_args+=("--network=$network")
+    docker_args+=("--network-alias=$network_alias")
+  fi
+
+  suppress_output "$DOCKER_BIN" container create "${docker_args[@]}" "${PLUGIN_IMAGE}:${PLUGIN_IMAGE_VERSION}" "${config_args[@]}"
+
+  if [[ -n "$(fn-plugin-property-get "$PLUGIN_COMMAND_PREFIX" "$SERVICE" post-create-network)" ]]; then
+    while IFS= read -r network_to_add; do
+      [[ -n "$network_to_add" ]] || continue
+      "$DOCKER_BIN" network connect --alias "$network_alias" "$network_to_add" "$service_name"
+    done < <(fn-plugin-property-get "$PLUGIN_COMMAND_PREFIX" "$SERVICE" post-create-network | tr , '\n')
+  fi
+
+  suppress_output "$DOCKER_BIN" container start "$(<"$service_root/ID")"
+  service_reconcile_connection_address "$SERVICE"
+
+  if [[ -n "$(fn-plugin-property-get "$PLUGIN_COMMAND_PREFIX" "$SERVICE" post-start-network)" ]]; then
+    while IFS= read -r network_to_add; do
+      [[ -n "$network_to_add" ]] || continue
+      "$DOCKER_BIN" network connect --alias "$network_alias" "$network_to_add" "$service_name"
+    done < <(fn-plugin-property-get "$PLUGIN_COMMAND_PREFIX" "$SERVICE" post-start-network | tr , '\n')
+  fi
+
+  dokku_log_verbose_quiet "Waiting for FoundationDB to accept its initial configuration"
+  service_configure_cluster "$SERVICE" "$storage_engine"
+  dokku_log_info2 "$PLUGIN_SERVICE container created: $SERVICE"
+  service_info "$SERVICE"
+}
+
+service_configure_cluster() {
+  declare SERVICE="$1" STORAGE_ENGINE="$2"
+  local service_name
+  local attempt
+
+  service_name="$(get_service_name "$SERVICE")"
+  for ((attempt = 1; attempt <= 60; attempt++)); do
+    if suppress_output timeout 5 "$DOCKER_BIN" container exec "$service_name" fdbcli --no-status -C /var/fdb/fdb.cluster --exec "configure new single $STORAGE_ENGINE"; then
+      break
+    fi
+    if suppress_output timeout 5 "$DOCKER_BIN" container exec "$service_name" fdbcli -C /var/fdb/fdb.cluster --exec 'status minimal'; then
+      break
+    fi
+    sleep 1
+  done
+
+  for ((attempt = 1; attempt <= 60; attempt++)); do
+    if suppress_output timeout 5 "$DOCKER_BIN" container exec "$service_name" fdbcli -C /var/fdb/fdb.cluster --exec 'status minimal'; then
+      return 0
+    fi
+    sleep 1
+  done
+
+  dokku_container_log_verbose_quiet "$service_name"
+  dokku_log_fail "$PLUGIN_SERVICE service did not become ready"
+}
+
+service_reconcile_connection_address() {
+  declare SERVICE="$1"
+  local service_root="$PLUGIN_DATA_ROOT/$SERVICE"
+  local service_name network connection_string connection_prefix recorded_address current_ip restarted_ip
+
+  service_name="$(get_service_name "$SERVICE")"
+  network="$(fn-plugin-property-get "$PLUGIN_COMMAND_PREFIX" "$SERVICE" initial-network)"
+  connection_string="$(service_connection_string "$SERVICE")"
+  connection_prefix="${connection_string%@*}"
+  recorded_address="${connection_string##*@}"
+  current_ip="$(get_container_ip "$service_name" "$network")"
+
+  [[ -n "$current_ip" ]] || dokku_log_fail "Unable to determine the service container IP"
+  [[ "$recorded_address" == "${current_ip}:${PLUGIN_DATASTORE_WAIT_PORT}" ]] && return 0
+
+  dokku_log_warn "$PLUGIN_SERVICE service $SERVICE received a new container IP; refreshing linked connection strings"
+  "$DOCKER_BIN" container stop "$service_name" >/dev/null
+  printf '%s@%s:%s\n' "$connection_prefix" "$current_ip" "$PLUGIN_DATASTORE_WAIT_PORT" >"$service_root/$PLUGIN_CONFIG_SUFFIX/fdb.cluster"
+  service_sync_linked_apps "$SERVICE"
+  "$DOCKER_BIN" container start "$service_name" >/dev/null
+
+  restarted_ip="$(get_container_ip "$service_name" "$network")"
+  [[ "$restarted_ip" == "$current_ip" ]] || dokku_log_fail "Container IP changed repeatedly while starting $SERVICE"
+  dokku_log_warn "Restart linked apps so they receive the updated FoundationDB connection string"
+}
+
+service_start() {
+  declare SERVICE="$1" QUIET="${2:-false}"
+  local service_root="$PLUGIN_DATA_ROOT/$SERVICE"
+  local service_name storage_engine id
+
+  service_name="$(get_service_name "$SERVICE")"
+  storage_engine="$(<"$service_root/STORAGE_ENGINE")"
+  id="$("$DOCKER_BIN" container ps -q --no-trunc --filter "name=^/${service_name}$" 2>/dev/null || true)"
+  if [[ -n "$id" ]]; then
+    [[ "$QUIET" == true ]] || dokku_log_warn "Service is already started"
+    printf '%s\n' "$id" >"$service_root/ID"
+    service_reconcile_connection_address "$SERVICE"
+    service_configure_cluster "$SERVICE" "$storage_engine"
+    return 0
+  fi
+
+  id="$("$DOCKER_BIN" container ps -aq --no-trunc --filter "name=^/${service_name}$" 2>/dev/null || true)"
+  if [[ -n "$id" ]]; then
+    "$DOCKER_BIN" container start "$id" >/dev/null
+    printf '%s\n' "$id" >"$service_root/ID"
+    service_reconcile_connection_address "$SERVICE"
+    service_configure_cluster "$SERVICE" "$storage_engine"
+    dokku_log_info2 "Container started"
+    return 0
+  fi
+
+  service_image_exists "$SERVICE" || dokku_log_fail "Service image is unavailable"
+  service_create_container "$SERVICE"
+}

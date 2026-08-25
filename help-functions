@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/config"
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+export SUBCOMMAND_ROOT
+SUBCOMMAND_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/subcommands"
+
+fn-help() {
+  declare CMD="$1"
+  local subcommand
+
+  case "$CMD" in
+    help | "$PLUGIN_COMMAND_PREFIX" | "$PLUGIN_COMMAND_PREFIX:default" | "$PLUGIN_COMMAND_PREFIX:help")
+      fn-help-all
+      return 0
+      ;;
+  esac
+
+  subcommand="${CMD#"${PLUGIN_COMMAND_PREFIX}":}"
+  if [[ -x "$SUBCOMMAND_ROOT/$subcommand" ]]; then
+    "$SUBCOMMAND_ROOT/$subcommand" "$@"
+    return $?
+  fi
+
+  return "$DOKKU_NOT_IMPLEMENTED_EXIT"
+}
+
+fn-help-all() {
+  cat <<EOF
+usage: dokku ${PLUGIN_COMMAND_PREFIX}[:COMMAND]
+
+Manage single-node ${PLUGIN_SERVICE} services.
+
+commands:
+    ${PLUGIN_COMMAND_PREFIX}:app-links <app>                    list services linked to an app
+    ${PLUGIN_COMMAND_PREFIX}:connect <service>                  open fdbcli
+    ${PLUGIN_COMMAND_PREFIX}:create <service> [options]         create a service
+    ${PLUGIN_COMMAND_PREFIX}:destroy <service> [-f|--force]     destroy a service and its data
+    ${PLUGIN_COMMAND_PREFIX}:enter <service> [command...]       enter the service container
+    ${PLUGIN_COMMAND_PREFIX}:exists <service>                   check whether a service exists
+    ${PLUGIN_COMMAND_PREFIX}:info <service> [flag]              show service information
+    ${PLUGIN_COMMAND_PREFIX}:link <service> <app> [options]     link a service to an app
+    ${PLUGIN_COMMAND_PREFIX}:linked <service> <app>             check whether a link exists
+    ${PLUGIN_COMMAND_PREFIX}:links <service>                    list linked apps
+    ${PLUGIN_COMMAND_PREFIX}:list                               list services
+    ${PLUGIN_COMMAND_PREFIX}:logs <service> [-t|--tail] [n]     show service logs
+    ${PLUGIN_COMMAND_PREFIX}:restart <service>                  restart a service
+    ${PLUGIN_COMMAND_PREFIX}:set <service> <key> [value]        set a service property
+    ${PLUGIN_COMMAND_PREFIX}:start <service>                    start a stopped service
+    ${PLUGIN_COMMAND_PREFIX}:stop <service>                     stop a service
+    ${PLUGIN_COMMAND_PREFIX}:unlink <service> <app> [options]   unlink a service from an app
+EOF
+}

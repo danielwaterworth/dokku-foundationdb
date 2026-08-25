@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+
+source "$(dirname "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)")/config"
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/property-functions"
+source "$(dirname "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)")/functions"
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+[[ "$1" == "$PLUGIN_COMMAND_PREFIX:set" ]] && shift
+declare SERVICE="${1:-}" KEY="${2:-}" VALUE="${3:-}"
+local_valid_keys=' initial-network post-create-network post-start-network '
+verify_service_name "$SERVICE"
+[[ "$local_valid_keys" == *" $KEY "* ]] || dokku_log_fail "Invalid key. Valid keys: initial-network, post-create-network, post-start-network"
+
+if [[ -n "$VALUE" ]]; then
+  fn-plugin-property-write "$PLUGIN_COMMAND_PREFIX" "$SERVICE" "$KEY" "$VALUE"
+else
+  fn-plugin-property-delete "$PLUGIN_COMMAND_PREFIX" "$SERVICE" "$KEY"
+fi

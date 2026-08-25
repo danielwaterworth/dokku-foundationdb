@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TEST_ROOT="$(mktemp -d)"
+CONTAINER_NAME="dokku-foundationdb-smoke-$$"
+IMAGE="${FOUNDATIONDB_IMAGE:-foundationdb/foundationdb}:${FOUNDATIONDB_IMAGE_VERSION:-7.3.77}"
+
+# shellcheck disable=SC2329
+cleanup() {
+  docker container rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  rm -rf "$TEST_ROOT"
+}
+trap cleanup EXIT
+
+mkdir -p "$TEST_ROOT/config" "$TEST_ROOT/data" "$TEST_ROOT/logs"
+cp "$REPO_ROOT/fdb-entrypoint" "$TEST_ROOT/config/dokku-entrypoint"
+chmod 0755 "$TEST_ROOT/config/dokku-entrypoint"
+: >"$TEST_ROOT/config/fdb.cluster"
+
+docker image inspect "$IMAGE" >/dev/null 2>&1 || docker image pull "$IMAGE" >/dev/null
+docker container create \
+  --cidfile "$TEST_ROOT/ID" \
+  --entrypoint /var/fdb/dokku-entrypoint \
+  --env FDB_CLUSTER_FILE=/var/fdb/fdb.cluster \
+  --env FDB_NETWORKING_MODE=container \
+  --hostname "$CONTAINER_NAME" \
+  --name "$CONTAINER_NAME" \
+  --volume "$TEST_ROOT/config/fdb.cluster:/var/fdb/fdb.cluster" \
+  --volume "$TEST_ROOT/config/dokku-entrypoint:/var/fdb/dokku-entrypoint:ro" \
+  --volume "$TEST_ROOT/data:/var/fdb/data" \
+  --volume "$TEST_ROOT/logs:/var/fdb/logs" \
+  "$IMAGE" --trace-format json >/dev/null
+
+connection_prefix='dokku_smoke:0123456789abcdef0123456789abcdef'
+printf '%s@127.0.0.1:4500\n' "$connection_prefix" >"$TEST_ROOT/config/fdb.cluster"
+
+docker container start "$CONTAINER_NAME" >/dev/null
+container_ip="$(
+  docker container inspect \
+    --format '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' \
+    "$CONTAINER_NAME" | awk 'NF {print; exit}'
+)"
+[[ -n "$container_ip" ]] || { echo 'not ok - container has no IP address' >&2; exit 1; }
+expected_connection="${connection_prefix}@${container_ip}:4500"
+for ((attempt = 1; attempt <= 30; attempt++)); do
+  if timeout 5 docker container exec "$CONTAINER_NAME" \
+    fdbcli --no-status -C /var/fdb/fdb.cluster --exec 'configure new single memory' >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+
+for ((attempt = 1; attempt <= 30; attempt++)); do
+  if timeout 5 docker container exec "$CONTAINER_NAME" \
+    fdbcli -C /var/fdb/fdb.cluster --exec 'status minimal' >/dev/null 2>&1; then
+    actual_connection="$(tr -d '\n' <"$TEST_ROOT/config/fdb.cluster")"
+    [[ "$actual_connection" == "$expected_connection" ]] || {
+      echo "not ok - cluster identity changed to $actual_connection" >&2
+      exit 1
+    }
+    echo 'ok - Docker lifecycle test passed'
+    exit 0
+  fi
+  sleep 1
+done
+
+docker container logs "$CONTAINER_NAME" >&2 || true
+echo 'not ok - FoundationDB did not become ready' >&2
+exit 1

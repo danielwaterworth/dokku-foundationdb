@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/config"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/functions"
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+APP="$1"
+for SERVICE in $(fn-services-list false); do
+  if in_links_file "$SERVICE" "$APP"; then
+    remove_from_links_file "$SERVICE" "$APP"
+    rm -f "$PLUGIN_DATA_ROOT/$SERVICE/links/$APP"
+  fi
+done

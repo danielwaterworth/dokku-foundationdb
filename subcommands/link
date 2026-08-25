@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+
+source "$(dirname "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)")/config"
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+source "$(dirname "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)")/functions"
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+# Usage: dokku foundationdb:link SERVICE APP [--alias NAME] [--no-restart]
+# The first link sets FDB_CLUSTER_FILE_CONTENTS. Additional links use generated aliases.
+[[ "$1" == "$PLUGIN_COMMAND_PREFIX:link" ]] && shift
+declare SERVICE="${1:-}" APP="${2:-$DOKKU_APP_NAME}"
+[[ -n "$APP" ]] || dokku_log_fail "Please specify an app"
+verify_service_name "$SERVICE"
+verify_app_name "$APP"
+service_parse_args "${@:3}"
+service_link "$SERVICE" "$APP"

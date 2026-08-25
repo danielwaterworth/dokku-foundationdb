@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+
+source "$(dirname "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)")/config"
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/property-functions"
+source "$(dirname "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)")/functions"
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+[[ "$1" == "$PLUGIN_COMMAND_PREFIX:destroy" ]] && shift
+declare SERVICE="${1:-}" FORCE_FLAG="${2:-}"
+verify_service_name "$SERVICE"
+
+SERVICE_ROOT="$PLUGIN_DATA_ROOT/$SERVICE"
+SERVICE_HOST_ROOT="$PLUGIN_DATA_HOST_ROOT/$SERVICE"
+[[ ! -s "$SERVICE_ROOT/LINKS" ]] || dokku_log_fail "Cannot delete a linked service"
+
+if [[ "$FORCE_FLAG" == force || "$FORCE_FLAG" == -f || "$FORCE_FLAG" == --force ]]; then
+  DOKKU_APPS_FORCE_DELETE=1
+fi
+
+if [[ -z "${DOKKU_APPS_FORCE_DELETE:-}" ]]; then
+  dokku_log_warn "WARNING: Potentially Destructive Action"
+  dokku_log_warn "This will permanently destroy the $SERVICE $PLUGIN_SERVICE service and all of its data."
+  dokku_log_warn "To proceed, type \"$SERVICE\""
+  read -rp '> ' confirmation
+  [[ "$confirmation" == "$SERVICE" ]] || dokku_log_fail "Confirmation did not match $SERVICE. Aborted."
+fi
+
+plugn trigger service-action pre-delete "$PLUGIN_COMMAND_PREFIX" "$SERVICE"
+service_container_rm "$SERVICE"
+"$DOCKER_BIN" container run --rm \
+  --volume "$SERVICE_HOST_ROOT:/service" \
+  "$PLUGIN_BUSYBOX_IMAGE" chmod -R 777 /service >/dev/null 2>&1 || true
+rm -rf "$SERVICE_ROOT"
+fn-plugin-property-destroy "$PLUGIN_COMMAND_PREFIX" "$SERVICE"
+plugn trigger service-action post-delete "$PLUGIN_COMMAND_PREFIX" "$SERVICE"
+dokku_log_info2 "$PLUGIN_SERVICE container deleted: $SERVICE"

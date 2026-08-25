@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/config"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common-functions"
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+[[ -z "${1:-}" || "$1" == "$PLUGIN_COMMAND_PREFIX" ]] || exit 0
+for service in $(fn-services-list false); do
+  echo "$PLUGIN_COMMAND_PREFIX:$service"
+done

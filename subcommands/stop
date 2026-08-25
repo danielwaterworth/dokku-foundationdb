@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+
+source "$(dirname "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)")/config"
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+source "$(dirname "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)")/functions"
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+[[ "$1" == "$PLUGIN_COMMAND_PREFIX:stop" ]] && shift
+declare SERVICE="${1:-}"
+verify_service_name "$SERVICE"
+service_stop "$SERVICE"

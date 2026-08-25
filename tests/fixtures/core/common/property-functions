@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+
+fn-plugin-property-get() {
+  return 0
+}
+
+fn-plugin-property-write() {
+  return 0
+}
+
+fn-plugin-property-delete() {
+  return 0
+}
+
+fn-plugin-property-destroy() {
+  return 0
+}
+
+fn-plugin-property-setup() {
+  return 0
+}

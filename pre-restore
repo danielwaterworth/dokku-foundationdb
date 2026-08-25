@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/config"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/functions"
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+SCHEDULER="$1"
+APP="$2"
+[[ "$SCHEDULER" == docker-local ]] || exit 0
+for SERVICE in $(fn-services-list false); do
+  in_links_file "$SERVICE" "$APP" || continue
+  [[ "$(service_status "$SERVICE")" == running ]] || service_start "$SERVICE"
+done

@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TEST_ROOT="$(mktemp -d)"
+trap 'rm -rf "$TEST_ROOT"' EXIT
+
+export DOKKU_LIB_ROOT="$TEST_ROOT/lib"
+export DOKKU_LIB_HOST_ROOT="$TEST_ROOT/lib"
+export PLUGIN_CORE_AVAILABLE_PATH="$REPO_ROOT/tests/fixtures/core"
+export PLUGIN_AVAILABLE_PATH="$REPO_ROOT/tests/fixtures/core"
+export PLUGIN_PATH="$TEST_ROOT/plugins"
+export DOKKU_API_VERSION=""
+export DOKKU_TRACE=""
+export DOCKER_BIN=true
+
+mkdir -p "$DOKKU_LIB_ROOT/services/foundationdb/example/config" "$PLUGIN_PATH/enabled"
+printf 'dokku_example:abcdef12@172.17.0.8:4500\n' >"$DOKKU_LIB_ROOT/services/foundationdb/example/config/fdb.cluster"
+printf 'true\n' >"$DOKKU_LIB_ROOT/services/foundationdb/example/ID"
+
+# shellcheck source=../common-functions
+source "$REPO_ROOT/common-functions"
+
+fail() {
+  echo "not ok - $1" >&2
+  exit 1
+}
+
+assert_equal() {
+  local expected="$1" actual="$2" message="$3"
+  [[ "$expected" == "$actual" ]] || fail "$message (expected '$expected', got '$actual')"
+}
+
+assert_equal foundationdb/foundationdb "$PLUGIN_IMAGE" 'default image'
+assert_equal 7.3.77 "$PLUGIN_IMAGE_VERSION" 'default image version'
+assert_equal 4500 "${PLUGIN_DATASTORE_PORTS[0]}" 'service port'
+
+entrypoint_output="$(
+  FDB_CLUSTER_FILE="$DOKKU_LIB_ROOT/services/foundationdb/example/config/fdb.cluster" \
+    FDB_LOCALITY_ID=test-node \
+    FDB_PROCESS_CLASS=storage \
+    FDBSERVER_BIN=/mock/fdbserver \
+    TINI_BIN=/usr/bin/echo \
+    "$REPO_ROOT/fdb-entrypoint" --knob_min_trace_severity=5
+)"
+assert_equal \
+  '-g -- /mock/fdbserver --listen-address 0.0.0.0:4500 --public-address 172.17.0.8:4500 --datadir /var/fdb/data --logdir /var/fdb/logs --locality-zoneid test-node --locality-machineid test-node --class storage --knob_min_trace_severity=5' \
+  "$entrypoint_output" \
+  'container entrypoint arguments'
+assert_equal \
+  'dokku_example:abcdef12@172.17.0.8:4500' \
+  "$(tr -d '\n' <"$DOKKU_LIB_ROOT/services/foundationdb/example/config/fdb.cluster")" \
+  'container entrypoint preserves the cluster identity'
+
+is_valid_service_name alpha-1 || fail 'valid service name was rejected'
+if is_valid_service_name 'bad/name'; then
+  fail 'invalid service name was accepted'
+fi
+
+assert_equal \
+  'dokku_example:abcdef12@172.17.0.8:4500' \
+  "$(service_connection_string example)" \
+  'connection string'
+
+export DOCKER_BIN=/usr/bin/echo
+assert_equal \
+  'container logs --tail 100 true' \
+  "$(service_logs example 100)" \
+  'logs line count without follow flag'
+assert_equal \
+  'container logs --tail 25 --follow true' \
+  "$(service_logs example --tail 25)" \
+  'logs line count with follow flag'
+export DOCKER_BIN=true
+
+assert_equal \
+  'DOKKU_FOUNDATIONDB_AQUA_CLUSTER_FILE_CONTENTS' \
+  "$(service_alternative_config_var 'FDB_CLUSTER_FILE_CONTENTS: value')" \
+  'first alternative config variable'
+
+assert_equal \
+  'DOKKU_FOUNDATIONDB_BLACK_CLUSTER_FILE_CONTENTS' \
+  "$(service_alternative_config_var $'FDB_CLUSTER_FILE_CONTENTS: value\nDOKKU_FOUNDATIONDB_AQUA_CLUSTER_FILE_CONTENTS: value')" \
+  'next alternative config variable'
+
+unset SERVICE_STORAGE_ENGINE SERVICE_MEMORY SERVICE_INITIAL_NETWORK
+service_parse_args --storage-engine memory --memory 512 --initial-network private
+assert_equal memory "$SERVICE_STORAGE_ENGINE" 'storage-engine argument'
+assert_equal 512 "$SERVICE_MEMORY" 'memory argument'
+assert_equal private "$SERVICE_INITIAL_NETWORK" 'network argument'
+
+grep -q 'FDB_CLUSTER_FILE_CONTENTS' "$REPO_ROOT/common-functions" || fail 'link environment contract is missing'
+if grep -q -- '--volume.*fdb.cluster' "$REPO_ROOT/common-functions"; then
+  fail 'app linking unexpectedly mounts a cluster file'
+fi
+
+help_output="$(DOKKU_NOT_IMPLEMENTED_EXIT=10 "$REPO_ROOT/commands" foundationdb)"
+grep -q 'foundationdb:create' <<<"$help_output" || fail 'command help is missing create'
+grep -q 'foundationdb:link' <<<"$help_output" || fail 'command help is missing link'
+
+echo 'ok - helper tests passed'

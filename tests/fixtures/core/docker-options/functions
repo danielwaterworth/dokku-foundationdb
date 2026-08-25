@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+
+add_passed_docker_option() {
+  return 0
+}
+
+remove_passed_docker_option() {
+  return 0
+}

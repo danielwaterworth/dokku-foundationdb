@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+
+source "$(dirname "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)")/config"
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/functions"
+source "$(dirname "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)")/functions"
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+# Usage: dokku foundationdb:create SERVICE [options]
+# Options:
+#   -C, --custom-env ENV                    semicolon-delimited container environment
+#   -c, --config-options OPTIONS            extra fdbserver arguments
+#   -e, --storage-engine ssd|memory         storage engine (default: ssd)
+#   -i, --image IMAGE                       container image
+#   -I, --image-version VERSION             container image tag
+#   -m, --memory MEGABYTES                  container memory limit
+#   -N, --initial-network NETWORK           initial Docker network
+#   -P, --post-create-network NETWORKS      comma-delimited networks attached before start
+#   -S, --post-start-network NETWORKS       comma-delimited networks attached after start
+[[ "$1" == "$PLUGIN_COMMAND_PREFIX:create" ]] && shift
+declare SERVICE="${1:-}"
+service_create "$SERVICE" "${@:2}"

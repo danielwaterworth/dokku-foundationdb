@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/config"
+source "$PLUGIN_CORE_AVAILABLE_PATH/common/property-functions"
+set -eo pipefail
+[[ $DOKKU_TRACE ]] && set -x
+
+pull-docker-image() {
+  declare IMAGE="$1"
+
+  if [[ "$PLUGIN_DISABLE_PULL" == "true" ]]; then
+    echo " !     ${PLUGIN_DISABLE_PULL_VARIABLE} environment variable detected. Not pulling ${IMAGE}." >&2
+    return 0
+  fi
+
+  if [[ -z "$("$DOCKER_BIN" image ls -q "$IMAGE" 2>/dev/null)" ]]; then
+    "$DOCKER_BIN" image pull "$IMAGE"
+  fi
+}
+
+plugin-install() {
+  command -v openssl >/dev/null || { echo 'openssl is required by dokku-foundationdb' >&2; return 1; }
+  command -v timeout >/dev/null || { echo 'timeout (GNU coreutils) is required by dokku-foundationdb' >&2; return 1; }
+  fn-plugin-property-setup "$PLUGIN_COMMAND_PREFIX"
+  pull-docker-image "${PLUGIN_IMAGE}:${PLUGIN_IMAGE_VERSION}"
+  pull-docker-image "$PLUGIN_BUSYBOX_IMAGE"
+
+  mkdir -p "$PLUGIN_DATA_ROOT" "$PLUGIN_CONFIG_ROOT"
+  chown "${DOKKU_SYSTEM_USER}:${DOKKU_SYSTEM_GROUP}" "$PLUGIN_DATA_ROOT" "$PLUGIN_CONFIG_ROOT"
+}
+
+plugin-install "$@"
