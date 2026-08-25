@@ -7,7 +7,7 @@ TEST_ROOT="$(mktemp -d)"
 CONTAINER_NAME="dokku-foundationdb-smoke-$$"
 IMAGE="${FOUNDATIONDB_IMAGE:-foundationdb/foundationdb}:${FOUNDATIONDB_IMAGE_VERSION:-7.3.77}"
 
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 cleanup() {
   docker container rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   rm -rf "$TEST_ROOT"
