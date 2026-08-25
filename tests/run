@@ -36,6 +36,11 @@ assert_equal foundationdb/foundationdb "$PLUGIN_IMAGE" 'default image'
 assert_equal 7.3.77 "$PLUGIN_IMAGE_VERSION" 'default image version'
 assert_equal 4500 "${PLUGIN_DATASTORE_PORTS[0]}" 'service port'
 
+unset SERVICE_STORAGE_ENGINE SERVICE_MEMORY SERVICE_INITIAL_NETWORK
+unset SERVICE_POST_CREATE_NETWORK SERVICE_POST_START_NETWORK PLUGIN_CONFIG_OPTIONS
+service_commit_config example
+assert_equal ssd "$(<"$DOKKU_LIB_ROOT/services/foundationdb/example/STORAGE_ENGINE")" 'committed default storage engine'
+
 entrypoint_output="$(
   FDB_CLUSTER_FILE="$DOKKU_LIB_ROOT/services/foundationdb/example/config/fdb.cluster" \
     FDB_LOCALITY_ID=test-node \

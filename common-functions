@@ -147,6 +147,8 @@ service_commit_config() {
   [[ -n "${SERVICE_INITIAL_NETWORK:-}" ]] && fn-plugin-property-write "$PLUGIN_COMMAND_PREFIX" "$SERVICE" initial-network "$SERVICE_INITIAL_NETWORK"
   [[ -n "${SERVICE_POST_CREATE_NETWORK:-}" ]] && fn-plugin-property-write "$PLUGIN_COMMAND_PREFIX" "$SERVICE" post-create-network "$SERVICE_POST_CREATE_NETWORK"
   [[ -n "${SERVICE_POST_START_NETWORK:-}" ]] && fn-plugin-property-write "$PLUGIN_COMMAND_PREFIX" "$SERVICE" post-start-network "$SERVICE_POST_START_NETWORK"
+
+  return 0
 }
 
 service_connection_string() {
